@@ -22,11 +22,14 @@ from telegram.ext import (
     filters,
 )
 
+# -----------------------------
+# Settings
+# -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("habit-bot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Neon / any Postgres
 TZ_NAME = os.environ.get("BOT_TZ", "Europe/Berlin")
 TZ = ZoneInfo(TZ_NAME)
 
@@ -35,12 +38,27 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не задан")
 
-NUDGE_TEMPLATES = [
-    "{name} уже отметил(а) выполнение 💪 Ты сегодня в игре?",
-    "Сегодня счёт {score}. Нужно поднажать?",
-    "{name} держит темп. Не отставай.",
+# -----------------------------
+# Social pressure templates (YOUR FINAL SET)
+# -----------------------------
+DAILY_NUDGES = [
+    '«{name} уже выполнил(а) “{title}” 💪 Ты сегодня в игре?»',
+    '«Не отставай! {name} уже сделал(а) “{title}”»',
+    '«{name} уже отметился(лась) сегодня. Один шаг — и вы на равных.»',
+    '«Похоже, сегодня ты пока в режиме наблюдателя 👀“{title}” ждет тебя »',
+    '«Не подводи {name}. Если ты тоже сделаешь “{title}” — будет красивое 2/2 ✅»',
+    '«Твой друг уже выполнил задание на сегодня. Слабо повторить за {name}? 😄»',
 ]
 
+PERIOD_NUDGES = [
+    '«{leader} впереди: {leader_count}/{target}. У тебя {me_count}/{target}. Догоним?»',
+    '«Разрыв {gap}. Один рывок — и ты вровень.»',
+    '«Гонка продолжается: {leader} впереди. Ускоряемся?»',
+]
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def now_tz() -> datetime:
     return datetime.now(TZ)
 
@@ -70,9 +88,10 @@ def end_of_period(d: date, unit: str) -> date:
         return sp + timedelta(days=6)
     raise ValueError("Unknown period_unit")
 
+# -----------------------------
+# DB (Postgres)
+# -----------------------------
 POOL: asyncpg.Pool | None = None
-scheduler: AsyncIOScheduler | None = None
-BOT_APP: Application | None = None
 
 async def db_init():
     global POOL
@@ -110,7 +129,23 @@ async def db_init():
                 check_date DATE NOT NULL
             );
         """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_checkins_goal_date ON checkins(goal_id, check_date);")
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_checkins_goal_date
+            ON checkins(goal_id, check_date);
+        """)
+
+        # Anti-spam: max 1 nudge per day per user per goal per kind
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS nudges (
+                goal_id BIGINT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                nudge_date DATE NOT NULL,
+                kind TEXT NOT NULL, -- daily | period
+                actor_user_id BIGINT,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(goal_id, user_id, nudge_date, kind)
+            );
+        """)
 
 async def fetchrow(q: str, *args):
     assert POOL is not None
@@ -127,6 +162,9 @@ async def execute(q: str, *args):
     async with POOL.acquire() as conn:
         return await conn.execute(q, *args)
 
+# -----------------------------
+# Drafts (in-memory)
+# -----------------------------
 @dataclass
 class CreateGoalDraft:
     step: str
@@ -138,6 +176,9 @@ class CreateGoalDraft:
 
 DRAFTS: dict[int, CreateGoalDraft] = {}
 
+# -----------------------------
+# Keyboards
+# -----------------------------
 def kb_main():
     return InlineKeyboardMarkup(
         [
@@ -172,11 +213,14 @@ def kb_goal_actions(goal_id: int, goal_type: str):
         rows.append([InlineKeyboardButton("🚗 Визуализация гонки", callback_data=f"race:{goal_id}")])
     return InlineKeyboardMarkup(rows)
 
+# -----------------------------
+# Bot handlers
+# -----------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args or []
 
-    # deep-link join
+    # Join via deep link: /start <code>
     if args:
         code = args[0].strip()
         goal = await fetchrow("SELECT * FROM goals WHERE code=$1", code)
@@ -307,7 +351,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
 
-    # КРИТИЧНО: отвечаем на callback, иначе кнопка "крутится"
+    # Critical: answer callback, otherwise buttons "spin"
     await query.answer()
 
     user = update.effective_user
@@ -405,24 +449,30 @@ async def create_goal_in_db(created_by: int, first_name: str, draft: CreateGoalD
 
 async def do_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE, goal_id: int, via_callback: bool):
     user = update.effective_user
+    msg_target = update.callback_query.message if via_callback and update.callback_query else update.message
+
     goal = await fetchrow("SELECT * FROM goals WHERE id=$1", goal_id)
     if not goal:
-        await (update.callback_query.message if via_callback and update.callback_query else update.message).reply_text("Цель не найдена.")
+        await msg_target.reply_text("Цель не найдена.")
         return
 
-    member = await fetchrow("SELECT 1 FROM goal_members WHERE goal_id=$1 AND user_id=$2", goal_id, user.id)
+    member = await fetchrow(
+        "SELECT 1 FROM goal_members WHERE goal_id=$1 AND user_id=$2",
+        goal_id, user.id
+    )
     if not member:
-        await (update.callback_query.message if via_callback and update.callback_query else update.message).reply_text("Ты не участник этой цели.")
+        await msg_target.reply_text("Ты не участник этой цели.")
         return
 
     d = today_date()
+
     if goal["goal_type"] == "daily":
         already = await fetchrow(
             "SELECT 1 FROM checkins WHERE goal_id=$1 AND user_id=$2 AND check_date=$3",
             goal_id, user.id, d
         )
         if already:
-            await (update.callback_query.message if via_callback and update.callback_query else update.message).reply_text("Сегодня уже отмечено ✅")
+            await msg_target.reply_text("Сегодня уже отмечено ✅")
             return
 
     await execute(
@@ -431,9 +481,10 @@ async def do_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE, goal_id
     )
 
     msg = "Отмечено ✅" if goal["goal_type"] == "daily" else "Засчитано ✅"
-    await (update.callback_query.message if via_callback and update.callback_query else update.message).reply_text(
-        msg, reply_markup=kb_goal_actions(goal_id, goal["goal_type"])
-    )
+    await msg_target.reply_text(msg, reply_markup=kb_goal_actions(goal_id, goal["goal_type"]))
+
+    # SOCIAL PRESSURE: nudge laggards after a successful checkin
+    await notify_laggards_after_checkin(context, goal_id, actor_user_id=user.id)
 
 async def build_progress(goal_id: int) -> tuple[str, InlineKeyboardMarkup]:
     goal = await fetchrow("SELECT * FROM goals WHERE id=$1", goal_id)
@@ -446,7 +497,10 @@ async def build_progress(goal_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     if goal["goal_type"] == "daily":
         d = today_date()
-        done_rows = await fetch("SELECT user_id FROM checkins WHERE goal_id=$1 AND check_date=$2", goal_id, d)
+        done_rows = await fetch(
+            "SELECT user_id FROM checkins WHERE goal_id=$1 AND check_date=$2",
+            goal_id, d
+        )
         done = {r["user_id"] for r in done_rows}
         lines = [f"<b>{goal['title']}</b>", f"Сегодня: <code>{d.isoformat()}</code>", ""]
         for m in members:
@@ -521,19 +575,154 @@ async def build_race_ascii(goal_id: int) -> str:
         lines.append(f"{name}: <b>{cnt}</b>/{target} |{track}|")
     return "\n".join(lines)
 
+# -----------------------------
+# Social pressure logic (with anti-spam)
+# -----------------------------
+async def notify_laggards_after_checkin(context: ContextTypes.DEFAULT_TYPE, goal_id: int, actor_user_id: int):
+    goal = await fetchrow("SELECT * FROM goals WHERE id=$1", goal_id)
+    if not goal:
+        return
+
+    members = await fetch("SELECT user_id, first_name FROM goal_members WHERE goal_id=$1", goal_id)
+    if not members or len(members) < 2:
+        return
+
+    actor = next((m for m in members if m["user_id"] == actor_user_id), None)
+    actor_name = ((actor["first_name"] or "Твой друг").strip() if actor else "Твой друг")
+
+    today = today_date()
+
+    # -------- Daily: nudge those who haven't checked in today
+    if goal["goal_type"] == "daily":
+        done_rows = await fetch(
+            "SELECT user_id FROM checkins WHERE goal_id=$1 AND check_date=$2",
+            goal_id, today
+        )
+        done_set = {r["user_id"] for r in done_rows}
+
+        laggards = [m for m in members if m["user_id"] not in done_set and m["user_id"] != actor_user_id]
+        if not laggards:
+            return
+
+        for m in laggards:
+            uid = int(m["user_id"])
+
+            # anti-spam: max 1 per day per user per goal for daily nudges
+            exists = await fetchrow(
+                "SELECT 1 FROM nudges WHERE goal_id=$1 AND user_id=$2 AND nudge_date=$3 AND kind='daily'",
+                goal_id, uid, today
+            )
+            if exists:
+                continue
+
+            tpl = DAILY_NUDGES[(goal_id + uid + len(done_set)) % len(DAILY_NUDGES)]
+            text = tpl.format(name=actor_name, title=goal["title"])
+
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                await execute(
+                    """
+                    INSERT INTO nudges(goal_id, user_id, nudge_date, kind, actor_user_id, created_at)
+                    VALUES($1,$2,$3,'daily',$4,$5)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    goal_id, uid, today, actor_user_id, now_tz()
+                )
+            except Exception as e:
+                logger.warning("Failed to send daily nudge: %s", e)
+        return
+
+    # -------- Period: nudge those who significantly lag behind the leader
+    unit = goal["period_unit"]
+    target = int(goal["period_target"] or 0)
+    if unit not in ("week", "month") or target <= 0:
+        return
+
+    sp = start_of_period(today, unit)
+    ep = end_of_period(today, unit)
+
+    counts: dict[int, int] = {}
+    for m in members:
+        uid = int(m["user_id"])
+        row = await fetchrow(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM checkins
+            WHERE goal_id=$1 AND user_id=$2 AND check_date BETWEEN $3 AND $4
+            """,
+            goal_id, uid, sp, ep
+        )
+        counts[uid] = int(row["cnt"])
+
+    leader_uid = max(counts, key=lambda k: counts[k])
+    leader_count = counts[leader_uid]
+    leader_name = next((m["first_name"] for m in members if int(m["user_id"]) == leader_uid), None)
+    leader_name = (leader_name or "Лидер").strip()
+
+    for m in members:
+        uid = int(m["user_id"])
+        if uid == leader_uid:
+            continue
+
+        me_count = counts.get(uid, 0)
+        gap = leader_count - me_count
+
+        # nudge only if behind by 1+ (you can make it 2+ if you want)
+        if gap < 1:
+            continue
+
+        exists = await fetchrow(
+            "SELECT 1 FROM nudges WHERE goal_id=$1 AND user_id=$2 AND nudge_date=$3 AND kind='period'",
+            goal_id, uid, today
+        )
+        if exists:
+            continue
+
+        tpl = PERIOD_NUDGES[(goal_id + uid + gap) % len(PERIOD_NUDGES)]
+        text = tpl.format(
+            leader=leader_name,
+            leader_count=leader_count,
+            target=target,
+            me_count=me_count,
+            gap=gap
+        )
+
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            await execute(
+                """
+                INSERT INTO nudges(goal_id, user_id, nudge_date, kind, actor_user_id, created_at)
+                VALUES($1,$2,$3,'period',$4,$5)
+                ON CONFLICT DO NOTHING
+                """,
+                goal_id, uid, today, actor_user_id, now_tz()
+            )
+        except Exception as e:
+            logger.warning("Failed to send period nudge: %s", e)
+
+# -----------------------------
+# Reminders scheduler
+# -----------------------------
+scheduler: AsyncIOScheduler | None = None
+BOT_APP: Application | None = None
+
 async def schedule_goal_reminder(app_: Application, goal_id: int):
     global scheduler
     if scheduler is None:
         return
+
     goal = await fetchrow("SELECT * FROM goals WHERE id=$1", goal_id)
     if not goal or not goal["reminder_hhmm"]:
         return
+
     t = parse_hhmm(goal["reminder_hhmm"])
     job_id = f"reminder_goal_{goal_id}"
+
     try:
         scheduler.remove_job(job_id)
     except Exception:
         pass
+
     scheduler.add_job(
         func=lambda: asyncio.create_task(send_goal_reminder(app_, goal_id)),
         trigger=CronTrigger(hour=t.hour, minute=t.minute, timezone=TZ),
@@ -542,20 +731,31 @@ async def schedule_goal_reminder(app_: Application, goal_id: int):
         misfire_grace_time=600,
     )
 
+async def reschedule_all(app_: Application):
+    goals = await fetch("SELECT id FROM goals WHERE reminder_hhmm IS NOT NULL AND reminder_hhmm <> ''")
+    for g in goals:
+        await schedule_goal_reminder(app_, int(g["id"]))
+
 async def send_goal_reminder(app_: Application, goal_id: int):
     goal = await fetchrow("SELECT * FROM goals WHERE id=$1", goal_id)
     if not goal:
         return
+
     members = await fetch("SELECT user_id FROM goal_members WHERE goal_id=$1", goal_id)
     if not members:
         return
 
+    # Daily reminders to those who haven't checked in today
     if goal["goal_type"] == "daily":
         d = today_date()
-        done_rows = await fetch("SELECT user_id FROM checkins WHERE goal_id=$1 AND check_date=$2", goal_id, d)
-        done = {r["user_id"] for r in done_rows}
+        done_rows = await fetch(
+            "SELECT user_id FROM checkins WHERE goal_id=$1 AND check_date=$2",
+            goal_id, d
+        )
+        done = {int(r["user_id"]) for r in done_rows}
+
         for m in members:
-            uid = m["user_id"]
+            uid = int(m["user_id"])
             if uid in done:
                 continue
             try:
@@ -568,7 +768,43 @@ async def send_goal_reminder(app_: Application, goal_id: int):
             except Exception as e:
                 logger.warning("Reminder send failed: %s", e)
 
-# ---------------- FastAPI wrapper for Render
+        return
+
+    # Period reminders (simple): "сколько осталось"
+    unit = goal["period_unit"]
+    target = int(goal["period_target"] or 0)
+    if unit not in ("week", "month") or target <= 0:
+        return
+
+    td = today_date()
+    sp = start_of_period(td, unit)
+    ep = end_of_period(td, unit)
+
+    for m in members:
+        uid = int(m["user_id"])
+        row = await fetchrow(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM checkins
+            WHERE goal_id=$1 AND user_id=$2 AND check_date BETWEEN $3 AND $4
+            """,
+            goal_id, uid, sp, ep
+        )
+        cnt = int(row["cnt"])
+        left = max(0, target - cnt)
+        try:
+            await app_.bot.send_message(
+                chat_id=uid,
+                text=f"Напоминание: <b>{goal['title']}</b>\nОсталось: <b>{left}</b> до цели.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_goal_actions(goal_id, goal["goal_type"]),
+            )
+        except Exception as e:
+            logger.warning("Period reminder send failed: %s", e)
+
+# -----------------------------
+# FastAPI wrapper for Render Web Service
+# -----------------------------
 app = FastAPI()
 
 @app.get("/health")
@@ -583,12 +819,14 @@ async def start_bot_forever():
 
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.start()
+    await reschedule_all(BOT_APP)
 
     BOT_APP.add_handler(CommandHandler("start", cmd_start))
     BOT_APP.add_handler(CommandHandler("goals", cmd_goals))
     BOT_APP.add_handler(CallbackQueryHandler(on_callback))
     BOT_APP.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
+    logger.info("Bot starting polling...")
     await BOT_APP.initialize()
     await BOT_APP.start()
     await BOT_APP.updater.start_polling()
@@ -604,7 +842,6 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     global BOT_APP, scheduler, POOL
-
     try:
         if scheduler:
             scheduler.shutdown(wait=False)
